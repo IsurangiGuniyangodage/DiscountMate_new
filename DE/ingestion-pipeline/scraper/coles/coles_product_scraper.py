@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import random
 import re
+import time
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -9,6 +10,9 @@ import httpx
 from util import (
     RunContext,
     RunResult,
+    emit_scrape_block,
+    emit_scrape_run_failed,
+    emit_scrape_summary,
     get_state_dir,
     legacy_timestamp,
     load_brand_queries,
@@ -224,7 +228,24 @@ def _save_checkpoint(
         _save_progress(progress_path, brand_index, len(all_products))
 
 
+def _record_status(http_counts: dict[str, int], status: str, source: str) -> None:
+    if status in ("SUCCESS", "SUCCESS_SCRAPERAPI"):
+        http_counts["http_200"] += 1
+    elif status == "RATE_LIMITED_429":
+        http_counts["http_429"] += 1
+    elif status in ("BLOCKED_403", "SCRAPERAPI_CREDITS_EXHAUSTED"):
+        http_counts["http_403"] += 1
+        emit_scrape_block(
+            source,
+            "http_403_or_incapsula_blocked" if status == "BLOCKED_403" else "scraperapi_credits_exhausted",
+        )
+    elif status.startswith("HTTP_5") or status.startswith("SCRAPERAPI_HTTP_5"):
+        http_counts["http_5xx"] += 1
+
+
 def run(context: RunContext) -> RunResult:
+    _run_start = time.monotonic()
+    _http_counts = {"http_200": 0, "http_403": 0, "http_429": 0, "http_5xx": 0}
     settings = context.settings.coles
     state_dir = get_state_dir(
         context.settings.app.output_dir, context.source, context.runner
@@ -238,129 +259,149 @@ def run(context: RunContext) -> RunResult:
     start_index = int(progress.get("last_brand_index", -1)) + 1
     fallback_hits = 0
 
-    with context.tracer.start_as_current_span("coles.products") as span:
-        span.set_attribute("brand_count", len(brands))
+    try:
+        with context.tracer.start_as_current_span("coles.products") as span:
+            span.set_attribute("brand_count", len(brands))
 
-        with httpx.Client(
-            timeout=settings.timeout_seconds, follow_redirects=True
-        ) as client:
-            cookies = parse_cookie_string(settings.cookie_string)
-            build_id = _detect_build_id(
-                client,
-                context,
-                settings.homepage_url,
-                settings.fallback_build_id,
-                cookies,
-            )
-            api_url = settings.api_base_template.format(build_id=build_id)
-            context.logger.info("Using Coles build id %s", build_id)
-            current_brand_index = max(start_index - 1, -1)
+            with httpx.Client(
+                timeout=settings.timeout_seconds, follow_redirects=True
+            ) as client:
+                cookies = parse_cookie_string(settings.cookie_string)
+                build_id = _detect_build_id(
+                    client,
+                    context,
+                    settings.homepage_url,
+                    settings.fallback_build_id,
+                    cookies,
+                )
+                api_url = settings.api_base_template.format(build_id=build_id)
+                context.logger.info("Using Coles build id %s", build_id)
+                current_brand_index = max(start_index - 1, -1)
 
-            try:
-                for brand_index in range(start_index, len(brands)):
-                    current_brand_index = brand_index
-                    brand = brands[brand_index]
-                    brand_products = 0
+                try:
+                    for brand_index in range(start_index, len(brands)):
+                        current_brand_index = brand_index
+                        brand = brands[brand_index]
+                        brand_products = 0
 
-                    for page in range(1, settings.max_pages + 1):
-                        payload, status = _search_direct(
-                            client,
-                            context,
-                            api_url,
-                            brand,
-                            page,
-                            settings.page_size,
-                            cookies,
-                        )
-                        if (
-                            payload is None
-                            and settings.scraperapi_key
-                            and status in {"BLOCKED_403", "RATE_LIMITED_429"}
-                        ):
-                            payload, status = _search_scraperapi(
+                        for page in range(1, settings.max_pages + 1):
+                            payload, status = _search_direct(
                                 client,
                                 context,
                                 api_url,
                                 brand,
                                 page,
                                 settings.page_size,
-                                settings.scraperapi_key,
+                                cookies,
                             )
-                            fallback_hits += 1
+                            _record_status(_http_counts, status, context.source)
 
-                        if payload is None:
-                            context.logger.warning(
-                                "Coles request failed for brand=%s page=%s status=%s",
+                            if (
+                                payload is None
+                                and settings.scraperapi_key
+                                and status in {"BLOCKED_403", "RATE_LIMITED_429"}
+                            ):
+                                payload, status = _search_scraperapi(
+                                    client,
+                                    context,
+                                    api_url,
+                                    brand,
+                                    page,
+                                    settings.page_size,
+                                    settings.scraperapi_key,
+                                )
+                                _record_status(_http_counts, status, context.source)
+                                fallback_hits += 1
+
+                            if payload is None:
+                                context.logger.warning(
+                                    "Coles request failed for brand=%s page=%s status=%s",
+                                    brand,
+                                    page,
+                                    status,
+                                )
+                                if status == "SCRAPERAPI_CREDITS_EXHAUSTED":
+                                    _save_checkpoint(
+                                        checkpoint_path,
+                                        progress_path,
+                                        all_products,
+                                        brand_index,
+                                    )
+                                    raise RuntimeError("ScraperAPI credits exhausted")
+                                break
+
+                            results = (
+                                ((payload.get("pageProps") or {}).get("searchResults"))
+                                or {}
+                            ).get("results") or []
+                            extracted = 0
+                            for item in results:
+                                if (
+                                    isinstance(item, dict)
+                                    and item.get("_type") == "PRODUCT"
+                                ):
+                                    all_products.append(
+                                        _extract_coles_product_data(item, brand)
+                                    )
+                                    extracted += 1
+
+                            brand_products += extracted
+                            context.logger.info(
+                                "Fetched %s Coles records for brand=%s page=%s",
+                                extracted,
                                 brand,
                                 page,
-                                status,
                             )
-                            if status == "SCRAPERAPI_CREDITS_EXHAUSTED":
-                                _save_checkpoint(
-                                    checkpoint_path,
-                                    progress_path,
-                                    all_products,
-                                    brand_index,
-                                )
-                                raise RuntimeError("ScraperAPI credits exhausted")
-                            break
+                            if extracted == 0 or extracted < settings.page_size:
+                                break
+                            _sleep_random_delay(
+                                context,
+                                settings.delay_seconds_min,
+                                settings.delay_seconds_max,
+                            )
 
-                        results = (
-                            ((payload.get("pageProps") or {}).get("searchResults"))
-                            or {}
-                        ).get("results") or []
-                        extracted = 0
-                        for item in results:
-                            if (
-                                isinstance(item, dict)
-                                and item.get("_type") == "PRODUCT"
-                            ):
-                                all_products.append(
-                                    _extract_coles_product_data(item, brand)
-                                )
-                                extracted += 1
+                        if ((brand_index + 1) % AUTOSAVE_EVERY_N_BRANDS == 0) or (
+                            brand_index == len(brands) - 1
+                        ):
+                            _save_checkpoint(
+                                checkpoint_path, progress_path, all_products, brand_index
+                            )
 
-                        brand_products += extracted
-                        context.logger.info(
-                            "Fetched %s Coles records for brand=%s page=%s",
-                            extracted,
-                            brand,
-                            page,
-                        )
-                        if extracted == 0 or extracted < settings.page_size:
-                            break
-                        _sleep_random_delay(
-                            context,
-                            settings.delay_seconds_min,
-                            settings.delay_seconds_max,
-                        )
-
-                    if ((brand_index + 1) % AUTOSAVE_EVERY_N_BRANDS == 0) or (
-                        brand_index == len(brands) - 1
-                    ):
-                        _save_checkpoint(
-                            checkpoint_path, progress_path, all_products, brand_index
-                        )
-
-            except KeyboardInterrupt:
-                _save_checkpoint(
-                    checkpoint_path,
-                    progress_path,
-                    all_products,
-                    max(current_brand_index, 0),
-                )
-                raise
-            except Exception:
-                _save_checkpoint(
-                    checkpoint_path,
-                    progress_path,
-                    all_products,
-                    max(current_brand_index, 0),
-                )
-                raise
+                except KeyboardInterrupt:
+                    _save_checkpoint(
+                        checkpoint_path,
+                        progress_path,
+                        all_products,
+                        max(current_brand_index, 0),
+                    )
+                    raise
+    except KeyboardInterrupt:
+        raise
+    except Exception:
+        emit_scrape_run_failed(context.source)
+        emit_scrape_summary(
+            source=context.source,
+            run_id=context.run_id,
+            status="failed",
+            rows_scraped=len(all_products),
+            duration_s=time.monotonic() - _run_start,
+            http_counts=_http_counts,
+            block_detected=_http_counts["http_403"] > 0,
+        )
+        raise
 
     remove_file_if_exists(checkpoint_path)
     remove_file_if_exists(progress_path)
+
+    emit_scrape_summary(
+        source=context.source,
+        run_id=context.run_id,
+        status="success",
+        rows_scraped=len(all_products),
+        duration_s=time.monotonic() - _run_start,
+        http_counts=_http_counts,
+        block_detected=_http_counts["http_403"] > 0,
+    )
 
     return RunResult(
         records=all_products,
@@ -370,3 +411,4 @@ def run(context: RunContext) -> RunResult:
             "record_count": len(all_products),
         },
     )
+    
