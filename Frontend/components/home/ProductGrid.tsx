@@ -164,12 +164,12 @@ function parseProductsPayload(
 }
 
 /** One API page per UI page: `GET /products?page=&limit=` (matches backend pagination). */
-async function fetchProductsPage(
-  page: number,
-  limit: number,
-  category: string | undefined,
-  search: string | undefined,
-  signal?: AbortSignal,
+export async function fetchProductsPage(
+   page: number,
+   limit: number,
+   category: string | undefined,
+   search: string | undefined,
+   signal?: AbortSignal
 ): Promise<{ items: ApiProduct[]; total: number; totalPages: number }> {
   const params = new URLSearchParams();
   params.set("page", String(page));
